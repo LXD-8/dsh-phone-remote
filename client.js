@@ -51,6 +51,14 @@ window.__ModuleLoader__.load({
         notifyTestSent: '测试通知已发送。',
         notifyNoSubs: '还没有推送订阅，先在手机上启用通知。',
         notifyTestFailed: '测试通知发送失败，请检查推送订阅。',
+        diagLabel: '诊断：',
+        diagReady: '条件已满足',
+        diagNotGateway: '不在手机网关上',
+        diagNotSecure: '当前不是 HTTPS',
+        diagNotStandalone: '不是从主屏幕打开',
+        diagNoPush: '浏览器没有 Push API（iPhone 需 16.4+）',
+        diagHttpsNotReady: 'HTTPS 还没就绪',
+        diagNoVapid: '推送服务没有 VAPID 公钥',
         notifyPermission: '通知权限被拒绝，请到 iPhone 设置 → 通知 → DSH 中允许。',
         notifyRegistered: '本机已订阅，但 Host 没有记录，请点「启用通知」重新登记。',
         notifyNoVapid: '推送服务不可用，缺少 VAPID 公钥。',
@@ -102,6 +110,14 @@ window.__ModuleLoader__.load({
         notifyTestSent: 'Test notification sent.',
         notifyNoSubs: 'No push subscription yet; enable notifications on the phone first.',
         notifyTestFailed: 'The test notification failed; check the push subscription.',
+        diagLabel: 'Diagnosis: ',
+        diagReady: 'all conditions met',
+        diagNotGateway: 'not on the phone gateway',
+        diagNotSecure: 'not HTTPS',
+        diagNotStandalone: 'not opened from the Home Screen',
+        diagNoPush: 'no Push API (iPhone needs 16.4+)',
+        diagHttpsNotReady: 'HTTPS is not ready',
+        diagNoVapid: 'the push service has no VAPID key',
         notifyPermission: 'Notification permission was denied. Allow it in iPhone Settings → Notifications → DSH.',
         notifyRegistered: 'This phone is subscribed, but the Host has no record. Tap Enable notifications to register it again.',
         notifyNoVapid: 'Push service unavailable; the VAPID public key is missing.',
@@ -182,6 +198,7 @@ window.__ModuleLoader__.load({
       },
       notifyMessage: { margin: '10px 0 0', fontSize: 12.5, lineHeight: 1.6, color: 'var(--dsw-alias-label-secondary)' },
       notifyError: { margin: '10px 0 0', fontSize: 12.5, lineHeight: 1.6, color: 'var(--dsw-alias-state-error-primary)' },
+      notifyDiag: { margin: '6px 0 0', fontSize: 11.5, lineHeight: 1.6, color: 'var(--dsw-alias-label-secondary)' },
     }
 
     function urlBase64ToUint8Array(base64String) {
@@ -212,8 +229,14 @@ window.__ModuleLoader__.load({
         const caUrl = typeof data?.caProfileUrl === 'string' ? data.caProfileUrl : ''
         const count = typeof data?.pushSubscriptions === 'number' ? data.pushSubscriptions : 0
         const ready = data?.httpsReady === true
-        const canEnable = gateway && secure && supported && ready && (!ios || standalone)
-          && typeof data?.vapidPublicKey === 'string'
+        const blockers = []
+        if (!gateway) blockers.push(t('diagNotGateway'))
+        if (!secure) blockers.push(t('diagNotSecure'))
+        if (ios && !standalone) blockers.push(t('diagNotStandalone'))
+        if (!supported) blockers.push(t('diagNoPush'))
+        if (!ready) blockers.push(t('diagHttpsNotReady'))
+        if (typeof data?.vapidPublicKey !== 'string') blockers.push(t('diagNoVapid'))
+        const canEnable = blockers.length === 0
 
         React.useEffect(() => {
           if (!gateway || !secure || !supported) return undefined
@@ -338,6 +361,8 @@ window.__ModuleLoader__.load({
           gateway && secure && !supported ? h('p', { style: styles.notifyMessage }, t('notifyUnsupported')) : null,
           subscribed && count === 0 ? h('p', { style: styles.notifyMessage }, t('notifyRegistered')) : null,
           data?.pushError ? h('p', { style: styles.notifyError }, `${t('notifyError')}：${data.pushError}`) : null,
+          h('p', { style: styles.notifyDiag },
+            `${t('diagLabel')}${blockers.length === 0 ? t('diagReady') : blockers.join(' · ')}`),
           showSetup
             ? h('div', null,
               h('div', { style: styles.notifyRow },
@@ -382,11 +407,15 @@ window.__ModuleLoader__.load({
             )
             : null,
           h('div', { style: styles.notifyActions },
-            canEnable && (!subscribed || count === 0)
+            (!subscribed || count === 0)
               ? h('button', {
                 type: 'button',
-                style: styles.notifyPrimary,
-                disabled: busy,
+                style: {
+                  ...styles.notifyPrimary,
+                  ...(canEnable ? {} : { opacity: 0.45, cursor: 'not-allowed' }),
+                },
+                disabled: busy || !canEnable,
+                title: blockers.join('；'),
                 onClick: enable,
               }, busy ? t('notifyEnabling') : (subscribed ? t('notifyRegister') : t('notifyEnable')))
               : null,

@@ -68,6 +68,14 @@ the duplicate notification; a test notification bypasses that.
 If Safari refuses to download the profile over HTTP, AirDrop
 `$DSH_HOME/phone-remote-tls/ca.mobileconfig` from the Mac to the phone and install
 it from Files.
+The **Enable notifications** button is always visible on the card. It stays
+disabled, with a one-line diagnosis, until the page is the phone's HTTPS
+gateway, opened from the iPhone Home Screen, and the browser exposes
+`PushManager` (iOS 16.4+). On the computer's own DSH settings the button is
+disabled by design; use the phone. If the diagnosis says "no Push API", the
+iPhone is below iOS 16.4 or the page is not the Home Screen app, and Web Push
+cannot be enabled from that context.
+
 
 Android Chrome needs the certificate (1), the HTTPS page (3), and the enable step
 (5); the Home Screen step is not required for Web Push.
