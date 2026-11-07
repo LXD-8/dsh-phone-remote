@@ -324,8 +324,12 @@ window.__ModuleLoader__.load({
             const body = await response.json().catch(() => ({}))
             if (!response.ok) throw new Error(body?.error ?? `HTTP ${response.status}`)
             if ((body.sent ?? 0) > 0) setMessage(t('notifyTestSent'))
-            else if ((body.failed ?? 0) > 0) setLocalError(t('notifyTestFailed'))
-            else setMessage(t('notifyNoSubs'))
+            else if ((body.failed ?? 0) > 0) {
+              const reason = typeof body.error?.reason === 'string' && body.error.reason !== ''
+                ? `（${body.error.reason}）`
+                : ''
+              setLocalError(`${t('notifyTestFailed')}${reason}`)
+            } else setMessage(t('notifyNoSubs'))
           } catch (reason) {
             setLocalError(String(reason?.message ?? reason))
           } finally {

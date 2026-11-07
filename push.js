@@ -19,6 +19,22 @@ async function readJson(path) {
   }
 }
 
+function describePushError(error) {
+  let reason = ''
+  if (typeof error?.body === 'string') {
+    try {
+      const parsed = JSON.parse(error.body)
+      if (typeof parsed?.reason === 'string') reason = parsed.reason
+    } catch {
+      reason = error.body.slice(0, 160)
+    }
+  }
+  return {
+    status: Number(error?.statusCode) || 0,
+    reason: reason === '' && error instanceof Error ? error.message : reason,
+  }
+}
+
 function validSubscription(value) {
   if (value === null || typeof value !== 'object') return false
   if (typeof value.endpoint !== 'string' || !value.endpoint.startsWith('https://')) return false
@@ -58,7 +74,7 @@ export async function createPushService({ home, webpush }) {
   }
   await save()
 
-  webpush.setVapidDetails('mailto:phone-remote@localhost', state.vapid.publicKey, state.vapid.privateKey)
+  webpush.setVapidDetails('https://github.com/LXD-8/dsh-phone-remote', state.vapid.publicKey, state.vapid.privateKey)
 
   const remove = async (endpoint) => {
     const before = state.subscriptions.length
@@ -99,6 +115,7 @@ export async function createPushService({ home, webpush }) {
       let sent = 0
       let failed = 0
       let removed = 0
+      let firstError = null
       for (const subscription of [...state.subscriptions]) {
         try {
           await webpush.sendNotification(subscription, body, { TTL: TTL_SECONDS })
@@ -110,10 +127,12 @@ export async function createPushService({ home, webpush }) {
             removed += 1
           } else {
             failed += 1
+            if (firstError === null) firstError = describePushError(error)
           }
         }
       }
-      return { sent, failed, removed }
+      if (firstError !== null) console.error('[phone-remote] push:', firstError)
+      return { sent, failed, removed, ...(firstError === null ? {} : { error: firstError }) }
     },
     async test() {
       return await this.send({
