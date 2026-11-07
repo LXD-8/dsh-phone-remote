@@ -128,14 +128,74 @@ live in `$DSH_HOME/phone-remote-tls/`; the VAPID keys and subscriptions live in
 `$DSH_HOME/phone-remote-push.json`. Deleting those files makes the plugin
 generate fresh material on the next start.
 
+## Remote access
+
+The gateway binds every interface, so any private path to the Mac works. Do not
+port-forward the gateway directly: the access code is the only app gate and it
+grants full control.
+
+### Tailscale (recommended)
+
+1. Install Tailscale on the Mac and the iPhone and sign in to the same tailnet.
+2. For control only, open `http://<tailscale-ip>:17890` on the phone; the
+   WireGuard tunnel encrypts the traffic. `tailscale ip -4` prints the address.
+3. For notifications, HTTPS and a Home Screen app, put the gateway behind
+   Tailscale Serve:
+
+   ```bash
+   tailscale serve --bg http://127.0.0.1:17890
+   tailscale serve status
+   ```
+
+   Enable HTTPS certificates for the tailnet if Tailscale asks. Open the printed
+   `https://<machine>.<tailnet>.ts.net` on the iPhone, sign in, add it to the
+   Home Screen, and enable notifications there. The Serve URL has a trusted
+   certificate, so the local CA and port 17891 are not needed for it.
+4. Keep the Mac awake and Tailscale connected. Install the Home Screen app from
+   the remote URL, not the LAN URL, so notification taps work away from home.
+
+Tailscale Serve and Cloudflare Tunnel terminate TLS locally. The gateway trusts
+`X-Forwarded-Proto` only from a loopback proxy, so its cookies and redirects stay
+HTTPS behind either one.
+
+### Tailscale IP with the local CA
+
+If you prefer not to use Serve: start Tailscale before the plugin, then use the
+`100.x` HTTPS address from **Settings → 手机遥控 → 其他地址**
+(`https://100.x.x.x:17891`). The plugin includes every current IPv4 address in
+the server certificate at startup; restart the plugin after Tailscale starts.
+Add the Home Screen app from that HTTPS URL and enable notifications there.
+
+### Cloudflare Tunnel
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:17890
+```
+
+Open the printed `https://….trycloudflare.com` URL on the phone; the certificate
+is trusted and Web Push works. This exposes the gateway to the internet: put
+Cloudflare Access in front of it (or use a named tunnel), keep the access code
+strong, and stop the tunnel when not needed.
+
+### Home VPN
+
+If the router already provides WireGuard or OpenVPN, connect the phone to it and
+use the normal LAN HTTPS URL; the local CA already works. The VPN has to stay on.
+
+### Keep the Mac reachable
+
+A sleeping Mac serves nothing. Keep it awake while you are away (Energy settings,
+or `caffeinate -s` while plugged in) and leave DSH and Tailscale running.
+
 ## Security
 
 The access code grants **full DSH control**, including the shell and file tools
 available to the agent. Treat it like a password.
 
 - The HTTP listener on `17890` is plain HTTP. The HTTPS listener on `17891` is
-  encrypted. Use both only on a trusted home or office LAN. Do not forward
-  either port from the internet.
+  encrypted. Do not port-forward either port from the internet. For access away
+  from home, prefer Tailscale (private) or Cloudflare Access (an authenticated
+  tunnel); plain port forwarding exposes full DSH control to the internet.
 - The local CA private key is in `$DSH_HOME/phone-remote-tls/ca.key`. Anyone
   with that key can sign certificates the phone trusts. Keep it private; delete
   the TLS directory and remove the profile from the phone to rotate it.

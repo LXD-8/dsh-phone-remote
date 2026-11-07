@@ -400,7 +400,18 @@ export function apply(ctx, config) {
   }
 
   function schemeOf(req) {
-    return req.socket.encrypted === true ? 'https' : 'http'
+    if (req.socket.encrypted === true) return 'https'
+    // Tailscale Serve and Cloudflare Tunnel terminate TLS locally and forward
+    // the original scheme. Only trust the header from a loopback proxy.
+    const remote = req.socket.remoteAddress
+    if (remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1') {
+      const forwarded = req.headers['x-forwarded-proto']
+      if (typeof forwarded === 'string') {
+        const first = forwarded.split(',')[0].trim().toLowerCase()
+        if (first === 'https' || first === 'http') return first
+      }
+    }
+    return 'http'
   }
 
   function forwardedHeaders(req, scheme) {
