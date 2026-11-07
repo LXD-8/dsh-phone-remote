@@ -1,0 +1,50 @@
+{
+  "name": "@local/dsh-phone-remote",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A DeepSeek Harness plugin that serves the Web UI to a phone on the same Wi-Fi behind a 6-digit access code.",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "login-page.js",
+    "whale.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "docs/*.png"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  },
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "remote",
+    "lan",
+    "phone"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LXD-8/dsh-phone-remote.git"
+  }
+}
