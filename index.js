@@ -12,12 +12,15 @@
  * trust fence keeps working while the phone talks to this gateway.
  */
 import http from 'node:http'
+import https from 'node:https'
 import net from 'node:net'
 import os from 'node:os'
 import crypto from 'node:crypto'
-import { promises as fs } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { promises as fs, readFileSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
 import { renderErrorPage, renderLoginPage } from './login-page.js'
+import { ensureTls } from './tls.js'
+import { createPushService } from './push.js'
 
 export const name = 'phone-remote'
 export const inject = ['webServer', 'connection']
@@ -28,6 +31,15 @@ const COOKIE_DAYS = 30
 const LOGIN_WINDOW_MS = 10 * 60 * 1000
 const LOGIN_MAX_ATTEMPTS = 8
 const MAX_BODY_BYTES = 4096
+const PUSH_BODY_LIMIT = 24_000
+const PUSH_GRACE_MS = 1200
+const CLOSING_SCAN = 8
+const APP_TITLE = 'DeepSeek Harness'
+/** Served verbatim on every gateway listener; the browser only registers it on HTTPS. */
+const SW_SOURCE = readFileSync(new URL('./sw.js', import.meta.url), 'utf8')
+/** Notification artwork; served before the access check. */
+const ICON_192 = readFileSync(new URL('./icon-192.png', import.meta.url))
+const ICON_512 = readFileSync(new URL('./icon-512.png', import.meta.url))
 const HOP_BY_HOP = new Set([
   'connection',
   'keep-alive',
@@ -97,10 +109,10 @@ function sign(secret, payload) {
   return crypto.createHmac('sha256', secret).update(payload).digest('base64url')
 }
 
-function makeAccessCookie(secret) {
+function makeAccessCookie(secret, secure = false) {
   const expires = Date.now() + COOKIE_DAYS * 24 * 60 * 60 * 1000
   const payload = `v1.${expires}`
-  return `${COOKIE_NAME}=${payload}.${sign(secret, payload)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_DAYS * 24 * 60 * 60}`
+  return `${COOKIE_NAME}=${payload}.${sign(secret, payload)}; Path=/; HttpOnly; SameSite=Lax;${secure ? ' Secure;' : ''} Max-Age=${COOKIE_DAYS * 24 * 60 * 60}`
 }
 
 function parseCookies(header) {
@@ -156,13 +168,13 @@ function lanAddresses() {
   return found.sort((a, b) => rank(a.name) - rank(b.name))
 }
 
-function readBody(req) {
+function readBody(req, limit = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     let size = 0
     const chunks = []
     req.on('data', (chunk) => {
       size += chunk.length
-      if (size > MAX_BODY_BYTES) {
+      if (size > limit) {
         reject(new Error('body too large'))
         req.destroy()
         return
@@ -201,16 +213,93 @@ function createLimiter() {
 }
 
 /**
+ * Collapse text to one line and cap it.
+ * @param {unknown} value - candidate text.
+ * @param {number} limit - maximum characters.
+ * @returns the normalized text, or an empty string.
+ */
+function compact(value, limit) {
+  if (typeof value !== 'string') return ''
+  const text = value.replace(/\s+/g, ' ').trim()
+  if (text.length <= limit) return text
+  return `${text.slice(0, Math.max(1, limit - 1)).trimEnd()}…`
+}
+
+/** Whether one Session belongs to a subagent run rather than the user's own work. */
+function isSubagent(session) {
+  return session?.header?.origin === 'subagent'
+}
+
+/** Compose a short label for one Session. */
+function sessionLabel(ctx, session) {
+  try {
+    const title = ctx.get('sessionTitle')?.get(session)?.title
+    if (typeof title === 'string' && title.trim() !== '') return compact(title, 80)
+  } catch {
+    // Title folding is optional; the folder below is always available.
+  }
+  const cwd = session?.header?.cwd
+  if (typeof cwd === 'string' && cwd !== '') return basename(cwd)
+  return APP_TITLE
+}
+
+/** Recover the text of the answer that closed the turn. */
+function closingAnswer(session, endSeq) {
+  try {
+    for (let seq = endSeq - 1; seq > 0 && seq > endSeq - CLOSING_SCAN; seq -= 1) {
+      const previous = session.eventAt(seq)
+      if (previous === undefined) continue
+      if (previous.type === 'assistant/message') {
+        const content = previous.data?.message?.content
+        if (!Array.isArray(content)) return undefined
+        const text = content
+          .filter(block => block?.type === 'text' && typeof block.text === 'string')
+          .map(block => block.text)
+          .join(' ')
+        const answer = compact(text, 160)
+        return answer === '' ? undefined : answer
+      }
+      if (previous.type === 'tool/result' || previous.type === 'user/message') return undefined
+    }
+  } catch {
+    // A projection miss only costs the preview text.
+  }
+  return undefined
+}
+
+/** Complete one JSON response. */
+function sendJson(res, status, body) {
+  const payload = JSON.stringify(body)
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(payload),
+  })
+  res.end(payload)
+}
+
+/** Read one JSON request body with a byte limit. */
+async function readJson(req, limit) {
+  const text = await readBody(req, limit)
+  if (text.trim() === '') return {}
+  return JSON.parse(text)
+}
+
+/**
  * @param {import('@deepseek-ai/cordis').Context} ctx
  * @param {{ port?: number }} config
  */
 export function apply(ctx, config) {
   const configuredPort = Number.isInteger(config?.port) && config.port >= 0 && config.port <= 65535 ? config.port : 17890
+  const configuredHttpsPort = Number.isInteger(config?.httpsPort) && config.httpsPort >= 0 && config.httpsPort <= 65535
+    ? config.httpsPort
+    : 17891
   const targetOrigin = ctx.webServer.getOrigin()
   const target = new URL(targetOrigin)
   const targetAuthority = target.host
   const targetHost = target.hostname.replace(/^\[|\]$/g, '')
   const targetPort = Number(target.port || 80)
+  const machineName = os.hostname()
 
   let state
   const statePromise = readState().then((loaded) => {
@@ -222,31 +311,66 @@ export function apply(ctx, config) {
     return state
   })
 
+  let pushService = null
+  let pushError = null
+  const pushPromise = (async () => {
+    try {
+      const webpush = await import('web-push')
+      pushService = await createPushService({ home: dshHome(), webpush })
+    } catch (error) {
+      pushError = error instanceof Error ? error.message : String(error)
+      console.error('[phone-remote] push:', error)
+    }
+  })()
+
   const limiter = createLimiter()
   const sockets = new Set()
+  let httpServer = null
+  let httpsServer = null
   let actualPort = null
-  let listenError = null
-  let server = null
+  let actualHttpsPort = null
+  let httpError = null
+  let httpsError = null
+  let tls = null
+  let tlsError = null
+  let disposed = false
 
   const addresses = () => lanAddresses()
 
   function status() {
     const port = actualPort ?? configuredPort
+    const securePort = actualHttpsPort ?? configuredHttpsPort
     const list = addresses().map((entry) => `http://${entry.address}:${port}`)
+    const secureList = addresses().map((entry) => `https://${entry.address}:${securePort}`)
     const hostName = os.hostname()
     if (hostName.endsWith('.local')) {
       const byName = `http://${hostName}:${port}`
       if (!list.includes(byName)) list.push(byName)
+      const byNameSecure = `https://${hostName}:${securePort}`
+      if (!secureList.includes(byNameSecure)) secureList.push(byNameSecure)
     }
+    const primaryHttp = list[0] ?? `http://127.0.0.1:${port}`
+    const primaryHttps = secureList[0] ?? `https://127.0.0.1:${securePort}`
     return {
-      running: server?.listening === true,
+      running: httpServer?.listening === true || httpsServer?.listening === true,
       port,
-      pin: state?.pin ?? '',
-      url: list[0] ?? `http://127.0.0.1:${port}`,
+      httpsPort: securePort,
+      httpsReady: tls !== null,
+      httpsRunning: httpsServer?.listening === true,
+      httpsError: tlsError ?? httpsError,
+      url: primaryHttp,
       urls: list,
-      error: listenError,
+      httpsUrl: primaryHttps,
+      httpsUrls: secureList,
+      caProfileUrl: `${primaryHttp}/_phone/ca.mobileconfig`,
+      caCertUrl: `${primaryHttp}/_phone/ca.crt`,
+      pin: state?.pin ?? '',
+      error: httpError,
       target: targetOrigin,
       hostName,
+      pushSubscriptions: pushService?.count ?? 0,
+      vapidPublicKey: pushService?.publicKey ?? null,
+      pushError,
     }
   }
 
@@ -275,7 +399,11 @@ export function apply(ctx, config) {
     })
   }
 
-  function forwardedHeaders(req) {
+  function schemeOf(req) {
+    return req.socket.encrypted === true ? 'https' : 'http'
+  }
+
+  function forwardedHeaders(req, scheme) {
     const headers = { ...req.headers }
     for (const key of HOP_BY_HOP) delete headers[key]
     headers.host = targetAuthority
@@ -289,7 +417,7 @@ export function apply(ctx, config) {
       }
     }
     headers['x-forwarded-host'] = req.headers.host ?? ''
-    headers['x-forwarded-proto'] = 'http'
+    headers['x-forwarded-proto'] = scheme
     const remote = req.socket.remoteAddress ?? ''
     headers['x-forwarded-for'] = headers['x-forwarded-for'] === undefined
       ? remote
@@ -303,14 +431,19 @@ export function apply(ctx, config) {
     return value
   }
 
+  function clearCookie(scheme) {
+    return `${COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${scheme === 'https' ? '; Secure' : ''}`
+  }
+
   function proxy(req, res) {
-    const requestOrigin = `http://${req.headers.host ?? `127.0.0.1:${actualPort}`}`
+    const scheme = schemeOf(req)
+    const requestOrigin = `${scheme}://${req.headers.host ?? `127.0.0.1:${actualPort}`}`
     const upstream = http.request({
       host: targetHost,
       port: targetPort,
       method: req.method,
       path: req.url,
-      headers: forwardedHeaders(req),
+      headers: forwardedHeaders(req, scheme),
     }, (response) => {
       if (response.statusCode === 401
         && (req.method === 'GET' || req.method === 'HEAD')
@@ -319,7 +452,7 @@ export function apply(ctx, config) {
         res.writeHead(303, {
           location: '/',
           'cache-control': 'no-store',
-          'set-cookie': `${COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax`,
+          'set-cookie': clearCookie(scheme),
         })
         res.end()
         return
@@ -346,10 +479,59 @@ export function apply(ctx, config) {
     req.pipe(upstream)
   }
 
+  function serveInline(res, status, type, body, extra = {}) {
+    res.writeHead(status, {
+      'content-type': type,
+      'cache-control': 'no-store',
+      ...extra,
+    })
+    res.end(body)
+  }
+
   async function handle(req, res) {
     await statePromise
     const url = new URL(req.url ?? '/', 'http://localhost')
     const pathname = url.pathname
+    const scheme = schemeOf(req)
+
+    if (pathname === '/sw.js') {
+      serveInline(res, 200, 'application/javascript; charset=utf-8', SW_SOURCE, {
+        'service-worker-allowed': '/',
+        'cache-control': 'no-cache',
+      })
+      return
+    }
+    if (pathname === '/_phone/icon-192.png') {
+      res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' })
+      res.end(ICON_192)
+      return
+    }
+    if (pathname === '/_phone/icon-512.png') {
+      res.writeHead(200, { 'content-type': 'image/png', 'cache-control': 'public, max-age=86400' })
+      res.end(ICON_512)
+      return
+    }
+    if (pathname === '/_phone/ca.mobileconfig') {
+      if (tls === null) {
+        serveInline(res, 503, 'text/plain; charset=utf-8', 'certificate not ready; reload in a moment')
+        return
+      }
+      res.writeHead(200, {
+        'content-type': 'application/x-apple-aspen-config',
+        'content-disposition': 'attachment; filename="DSH-Phone-Remote-CA.mobileconfig"',
+        'cache-control': 'no-store',
+      })
+      res.end(tls.caProfileXml)
+      return
+    }
+    if (pathname === '/_phone/ca.crt') {
+      if (tls === null) {
+        serveInline(res, 503, 'text/plain; charset=utf-8', 'certificate not ready; reload in a moment')
+        return
+      }
+      serveInline(res, 200, 'application/x-x509-ca-cert', tls.caCertPem)
+      return
+    }
 
     if (pathname === '/_phone/login' && req.method === 'POST') {
       const ip = req.socket.remoteAddress ?? 'unknown'
@@ -386,7 +568,7 @@ export function apply(ctx, config) {
       res.writeHead(303, {
         location: '/',
         'cache-control': 'no-store',
-        'set-cookie': [makeAccessCookie(state.secret), ...upstreamCookies],
+        'set-cookie': [makeAccessCookie(state.secret, scheme === 'https'), ...upstreamCookies],
       })
       res.end()
       return
@@ -408,24 +590,7 @@ export function apply(ctx, config) {
     res.end('DSH phone remote: authentication required')
   }
 
-  server = http.createServer((req, res) => {
-    handle(req, res).catch((error) => {
-      console.error('[phone-remote] request:', error)
-      if (!res.headersSent) {
-        res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
-        res.end('internal error')
-      } else {
-        res.destroy()
-      }
-    })
-  })
-
-  server.on('connection', (socket) => {
-    sockets.add(socket)
-    socket.on('close', () => sockets.delete(socket))
-  })
-
-  server.on('upgrade', (req, socket, head) => {
+  function upgrade(req, socket, head) {
     if (!accessCookieValid(state?.secret ?? '', req.headers.cookie)) {
       socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
       return
@@ -458,20 +623,141 @@ export function apply(ctx, config) {
     })
     upstream.on('error', () => socket.destroy())
     socket.on('error', () => upstream.destroy())
+  }
+
+  function attach(server, kind) {
+    server.on('connection', (socket) => {
+      sockets.add(socket)
+      socket.on('close', () => sockets.delete(socket))
+    })
+    server.on('upgrade', upgrade)
+    server.on('error', (error) => {
+      if (kind === 'https') httpsError = error.message
+      else httpError = error.message
+      console.error(`[phone-remote] ${kind} listen:`, error)
+    })
+    server.on('listening', () => {
+      const address = server.address()
+      if (address !== null && typeof address === 'object') {
+        if (kind === 'https') actualHttpsPort = address.port
+        else actualPort = address.port
+      }
+      const port = kind === 'https' ? actualHttpsPort : actualPort
+      console.log(`[phone-remote] ${kind} listening on 0.0.0.0:${port ?? ''} -> ${targetOrigin}`)
+    })
+  }
+
+  const handler = (req, res) => {
+    handle(req, res).catch((error) => {
+      console.error('[phone-remote] request:', error)
+      if (!res.headersSent) {
+        res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' })
+        res.end('internal error')
+      } else {
+        res.destroy()
+      }
+    })
+  }
+
+  httpServer = http.createServer(handler)
+  attach(httpServer, 'http')
+  httpServer.listen(configuredPort, '0.0.0.0')
+
+  void (async () => {
+    try {
+      tls = await ensureTls({
+        home: dshHome(),
+        hostName: machineName,
+        addresses: addresses().map((entry) => entry.address),
+      })
+      if (disposed) return
+      httpsServer = https.createServer({ key: tls.key, cert: tls.cert }, handler)
+      attach(httpsServer, 'https')
+      httpsServer.listen(configuredHttpsPort, '0.0.0.0')
+    } catch (error) {
+      tlsError = error instanceof Error ? error.message : String(error)
+      console.error('[phone-remote] tls:', error)
+    }
+  })()
+
+  function sendPush(payload) {
+    if (disposed) return
+    void pushPromise.then(() => {
+      if (disposed || pushService === null) return
+      return pushService.send(payload).catch((error) => console.error('[phone-remote] push send:', error))
+    })
+  }
+
+  function notifyIfPending(describe, pending) {
+    let settled = false
+    void Promise.resolve(pending).then(() => { settled = true }, () => { settled = true })
+    const timer = setTimeout(() => {
+      if (settled || disposed) return
+      const payload = describe()
+      if (payload !== undefined) sendPush(payload)
+    }, PUSH_GRACE_MS)
+    timer.unref?.()
+  }
+
+  function sessionUrl(session) {
+    return session?.id === undefined
+      ? '/'
+      : `/?phoneRemoteSession=${encodeURIComponent(session.id)}`
+  }
+
+  ctx.on('session/event', (session, event) => {
+    if (event?.type !== 'turn/end') return
+    const kind = event.data?.reason?.kind
+    if (kind !== 'completed' && kind !== 'max-tokens' && kind !== 'error') return
+    if (isSubagent(session)) return
+    const answer = kind === 'completed' ? closingAnswer(session, event.seq) : undefined
+    const body = kind === 'completed'
+      ? (answer === undefined ? '这一轮已完成，可以查看结果。' : `任务完成：${answer}`)
+      : kind === 'max-tokens'
+        ? '输出达到上限，可以让它继续。'
+        : '这一轮出错，请打开会话查看。'
+    sendPush({
+      title: sessionLabel(ctx, session),
+      body,
+      url: sessionUrl(session),
+      tag: session?.id ?? 'dsh-phone-remote-task',
+    })
   })
 
-  server.on('error', (error) => {
-    listenError = error.message
-    console.error('[phone-remote] listen:', error)
+  ctx.on('user-questions/request', (request, next) => {
+    const pending = next()
+    notifyIfPending(() => {
+      const question = Array.isArray(request?.questions) ? request.questions[0] : undefined
+      if (question === undefined) return undefined
+      const session = request?.agent?.id === undefined ? undefined : ctx.get('sessions')?.get(request.agent.id)
+      const text = compact([question.header, question.question]
+        .filter((part) => typeof part === 'string' && part !== '')
+        .join('：'), 160)
+      return {
+        title: session === undefined ? APP_TITLE : sessionLabel(ctx, session),
+        body: `需要你的回答：${text === '' ? 'Agent 正在等待你的回答。' : text}`,
+        url: sessionUrl(session),
+        tag: session?.id ?? 'dsh-phone-remote-question',
+      }
+    }, pending)
+    return pending
   })
 
-  server.on('listening', () => {
-    const address = server.address()
-    if (address !== null && typeof address === 'object') actualPort = address.port
-    console.log(`[phone-remote] listening on 0.0.0.0:${actualPort ?? configuredPort} -> ${targetOrigin}`)
+  ctx.on('approval/request', (request, next) => {
+    const pending = next()
+    notifyIfPending(() => {
+      const session = request?.agent?.id === undefined ? undefined : ctx.get('sessions')?.get(request.agent.id)
+      const reason = compact(request?.displayReason?.zh ?? request?.displayReason?.en ?? request?.reason, 160)
+      const tool = typeof request?.toolName === 'string' ? request.toolName : ''
+      return {
+        title: session === undefined ? APP_TITLE : sessionLabel(ctx, session),
+        body: `需要你的授权：${reason === '' ? `工具 ${tool || '调用'} 正在等待你的批准。` : `${tool === '' ? '' : `${tool}：`}${reason}`}`,
+        url: sessionUrl(session),
+        tag: session?.id ?? 'dsh-phone-remote-approval',
+      }
+    }, pending)
+    return pending
   })
-
-  server.listen(configuredPort, '0.0.0.0')
 
   ctx.effect(() => {
     const disposeStatus = ctx.webServer.register({
@@ -479,6 +765,7 @@ export function apply(ctx, config) {
       path: '/phone-remote/status',
       handler: async (req, res) => {
         await statePromise
+        await pushPromise
         if (req.method !== 'GET') {
           res.writeHead(405, { allow: 'GET' })
           res.end()
@@ -490,8 +777,7 @@ export function apply(ctx, config) {
           res.end()
           return
         }
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-        res.end(JSON.stringify(status()))
+        sendJson(res, 200, status())
       },
     })
     const disposeRotate = ctx.webServer.register({
@@ -499,6 +785,7 @@ export function apply(ctx, config) {
       path: '/phone-remote/rotate',
       handler: async (req, res) => {
         await statePromise
+        await pushPromise
         if (req.method !== 'POST') {
           res.writeHead(405, { allow: 'POST' })
           res.end()
@@ -511,26 +798,135 @@ export function apply(ctx, config) {
           return
         }
         const next = { pin: newPin(), secret: newSecret(), createdAt: Date.now() }
-        writeState(next).then(() => {
+        try {
+          await writeState(next)
           state = next
-          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' })
-          res.end(JSON.stringify(status()))
-        }, (error) => {
+          if (pushService !== null) await pushService.removeAll()
+          sendJson(res, 200, status())
+        } catch (error) {
           console.error('[phone-remote] rotate:', error)
-          res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
-          res.end(JSON.stringify({ error: '无法保存新的访问码' }))
-        })
+          sendJson(res, 500, { error: '无法保存新的访问码' })
+        }
+      },
+    })
+    const disposeSubscribe = ctx.webServer.register({
+      kind: 'exact',
+      path: '/phone-remote/push/subscribe',
+      handler: async (req, res) => {
+        await pushPromise
+        if (req.method !== 'POST') {
+          res.writeHead(405, { allow: 'POST' })
+          res.end()
+          return
+        }
+        const rejection = ctx.connection.requestRejection(req)
+        if (rejection !== undefined) {
+          res.writeHead(rejection)
+          res.end()
+          return
+        }
+        if (pushService === null) {
+          sendJson(res, 503, { error: pushError ?? '推送服务不可用' })
+          return
+        }
+        let body
+        try {
+          body = await readJson(req, PUSH_BODY_LIMIT)
+        } catch {
+          sendJson(res, 400, { error: '无效的请求体' })
+          return
+        }
+        const subscription = body?.subscription ?? body
+        try {
+          const count = await pushService.add(subscription)
+          sendJson(res, 200, { ok: true, count })
+        } catch (error) {
+          sendJson(res, 400, { error: error instanceof Error ? error.message : '无效的推送订阅' })
+        }
+      },
+    })
+    const disposeUnsubscribe = ctx.webServer.register({
+      kind: 'exact',
+      path: '/phone-remote/push/unsubscribe',
+      handler: async (req, res) => {
+        await pushPromise
+        if (req.method !== 'POST') {
+          res.writeHead(405, { allow: 'POST' })
+          res.end()
+          return
+        }
+        const rejection = ctx.connection.requestRejection(req)
+        if (rejection !== undefined) {
+          res.writeHead(rejection)
+          res.end()
+          return
+        }
+        if (pushService === null) {
+          sendJson(res, 503, { error: pushError ?? '推送服务不可用' })
+          return
+        }
+        let body
+        try {
+          body = await readJson(req, PUSH_BODY_LIMIT)
+        } catch {
+          sendJson(res, 400, { error: '无效的请求体' })
+          return
+        }
+        const endpoint = typeof body?.endpoint === 'string' ? body.endpoint : ''
+        if (endpoint === '') {
+          sendJson(res, 400, { error: '缺少 endpoint' })
+          return
+        }
+        await pushService.remove(endpoint)
+        sendJson(res, 200, { ok: true, count: pushService.count })
+      },
+    })
+    const disposeTest = ctx.webServer.register({
+      kind: 'exact',
+      path: '/phone-remote/push/test',
+      handler: async (req, res) => {
+        await pushPromise
+        if (req.method !== 'POST') {
+          res.writeHead(405, { allow: 'POST' })
+          res.end()
+          return
+        }
+        const rejection = ctx.connection.requestRejection(req)
+        if (rejection !== undefined) {
+          res.writeHead(rejection)
+          res.end()
+          return
+        }
+        if (pushService === null) {
+          sendJson(res, 503, { error: pushError ?? '推送服务不可用' })
+          return
+        }
+        try {
+          sendJson(res, 200, await pushService.test())
+        } catch (error) {
+          console.error('[phone-remote] push test:', error)
+          sendJson(res, 500, { error: '测试通知发送失败' })
+        }
       },
     })
     return () => {
+      disposed = true
       disposeStatus()
       disposeRotate()
+      disposeSubscribe()
+      disposeUnsubscribe()
+      disposeTest()
       for (const socket of sockets) socket.destroy()
       sockets.clear()
       try {
-        server?.close()
+        httpServer?.close()
       } catch (error) {
-        console.error('[phone-remote] close:', error)
+        console.error('[phone-remote] close http:', error)
+      }
+      try {
+        httpsServer?.close()
+      } catch (error) {
+        console.error('[phone-remote] close https:', error)
       }
     }
   })

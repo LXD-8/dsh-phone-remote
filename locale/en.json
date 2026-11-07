@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Phone remote",
-    "description": "Open a PIN-protected page from a phone browser on the same Wi-Fi to control DSH on this computer."
+    "description": "Open the DSH Web UI from a phone on the same Wi-Fi behind a 6-digit access code, with Web Push notifications for finished turns and pending decisions."
   }
 }
