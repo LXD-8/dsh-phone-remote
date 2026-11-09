@@ -95,10 +95,10 @@ dsh plugin --profile desktop add github:LXD-8/dsh-phone-remote
 ```
 
 Or clone this repository, link it into the profile, and select the
-`@local/dsh-phone-remote` bundle in **Plugins**:
+`dsh-phone-remote` bundle in **Plugins**:
 
 ```json
-"@local/dsh-phone-remote": "link:/absolute/path/to/dsh-phone-remote"
+"dsh-phone-remote": "link:/absolute/path/to/dsh-phone-remote"
 ```
 
 When installing from a linked checkout, run `pnpm install` in the plugin
