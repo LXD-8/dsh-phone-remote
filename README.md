@@ -26,15 +26,23 @@ the local network and keeps the real DSH server as its upstream:
 
 1. The visitor opens the gateway and enters the six-digit access code.
 2. On success the gateway asks `ctx.connection.authenticatedUrl()` for a normal
-   DSH browser session, relays that cookie to the phone, and sets its own
-   signed 30-day gateway cookie.
+   DSH browser session, keeps that cookie on the server, and sets its own signed
+   gateway cookie on the phone.
 3. It proxies the page, static assets and the `/api/remote.mux` WebSocket to the
    loopback server, rewriting upstream `Host` and `Origin` to the real loopback
    authority. DSH's browser-trust fence and session authorization therefore
    keep working unchanged.
 
+The access code is needed once per phone. The gateway cookie is written with the
+longest lifetime browsers accept (400 days) and is rolled forward on every visit
+once it is 30 days old, so a phone that does not clear its cookies stays signed
+in. The DSH session itself belongs to the gateway: when DSH restarts, or its own
+session cookie runs out, the gateway mints a new one on the next request instead
+of asking the phone again. Rotating the access code is the deliberate way to
+revoke a phone.
+
 The phone runs the same Web bundles and UI the desktop shows. The gateway adds
-only the LAN listeners, the access-code page and the cookie translation; it does
+only the LAN listeners, the access-code page and the DSH session relay; it does
 not reimplement sessions, chat or tool execution.
 
 ## Push notifications
@@ -115,6 +123,9 @@ Host services, so it is meant for a profile with the Web UI.
 2. In DSH, open **Settings → 手机遥控** and copy the address and access code.
 3. Open the address in the phone browser and enter the code.
 4. Add the page to the home screen if you want an app-like entry.
+
+The code is asked once. The phone stays signed in through DSH restarts,
+network changes and browser relaunches for as long as it keeps its cookies.
 
 The settings page shows the HTTP address, the HTTPS address, the certificate
 address, the code and the `.local` alternative, and can rotate the code.
@@ -200,15 +211,20 @@ available to the agent. Treat it like a password.
   with that key can sign certificates the phone trusts. Keep it private; delete
   the TLS directory and remove the profile from the phone to rotate it.
 - The six-digit code is limited to 8 attempts per 10 minutes per client address.
-- The gateway cookie is an HMAC-signed, `HttpOnly`, `SameSite=Lax` cookie with a
-  30-day lifetime. On HTTPS it is also `Secure`. Rotating the code rotates the
-  signing key and revokes every existing phone and push subscription.
+- The gateway cookie is an HMAC-signed, `HttpOnly`, `SameSite=Lax` cookie. It is
+  written with the 400-day maximum browsers accept and rolled forward on every
+  visit, so it lasts until the phone clears its site data. On HTTPS it is also
+  `Secure`. Rotating the code rotates the signing key and revokes every existing
+  phone and push subscription.
+- DSH's own browser session stays on the gateway and is renewed silently. The
+  phone's browser only carries the gateway cookie; stale DSH cookies a phone may
+  still hold are ignored, never relayed.
 - Both listeners bind `0.0.0.0` and are reachable from every interface the
   computer has. Disable the plugin (or change the ports) when you do not want it
   listening.
-- DSH's own session cookie is relayed to the phone. It is scoped to the gateway
-  origin in the phone's browser; the gateway always sends the loopback authority
-  upstream.
+- The gateway holds one DSH browser session and uses it for every signed-in
+  phone. Any phone that has the gateway cookie has the same DSH control the code
+  grants; revoke access by rotating the code.
 - The push subscription is a separate capability from the access code. Rotating
   the code clears it; disabling the plugin stops delivery.
 
@@ -233,6 +249,12 @@ available to the agent. Treat it like a password.
 Checked against DSH `0.2.2-rc.1` on macOS:
 
 - HTTP and HTTPS sign-in, the wrong-code error, and the rate limit;
+- login persistence: the phone keeps access after a simulated DSH restart (a
+  new process token with its own sessions dropped), a JSON GET and a WebSocket
+  upgrade are retried with a freshly minted session, a 31-day-old gateway cookie
+  is rolled forward, and a version-1 30-day cookie still signs in;
+- the gateway relays no DSH session cookie to the phone and ignores stale ones
+  the phone still sends;
 - the generated CA verifies the HTTPS server certificate, and the
   `.mobileconfig` passes `plutil -lint`;
 - minting a DSH session and proxying the page, static assets, `/api` calls and

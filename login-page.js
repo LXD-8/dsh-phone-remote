@@ -179,7 +179,7 @@ export function renderLoginPage({ error = '', pin = '' } = {}) {
     </form>
     <div class="hint">
       ${LOCK_ICON}
-      <span>访问码在 DSH 的「设置 → 手机遥控」中查看。仅限同一 Wi-Fi 下的设备使用。</span>
+      <span>访问码在 DSH 的「设置 → 手机遥控」中查看。登录一次后会一直保持登录，清理浏览器数据后才需要重新输入。</span>
     </div>
     <script>
       document.querySelector('form').addEventListener('submit', function () {

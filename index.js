@@ -27,7 +27,19 @@ export const inject = ['webServer', 'connection']
 
 const STATE_VERSION = 1
 const COOKIE_NAME = 'dsh_phone_remote'
-const COOKIE_DAYS = 30
+/**
+ * Browsers clamp persistent cookie lifetimes to 400 days, so this is the
+ * longest lifetime one write can carry. Every proxied response refreshes the
+ * cookie once it is older than COOKIE_REFRESH_MS, so a phone that keeps visiting
+ * never reaches the clamp.
+ */
+const COOKIE_MAX_AGE_MS = 400 * 24 * 60 * 60 * 1000
+const COOKIE_MAX_AGE_SECONDS = Math.floor(COOKIE_MAX_AGE_MS / 1000)
+const COOKIE_REFRESH_MS = 30 * 24 * 60 * 60 * 1000
+/** Lifetime assumed for a DSH session cookie that carries no Max-Age or Expires. */
+const UPSTREAM_SESSION_MS = 30 * 24 * 60 * 60 * 1000
+/** DSH browser-session cookies stay with the gateway; they never reach the phone. */
+const UPSTREAM_COOKIE_PREFIX = 'dsh-auth-'
 const LOGIN_WINDOW_MS = 10 * 60 * 1000
 const LOGIN_MAX_ATTEMPTS = 8
 const MAX_BODY_BYTES = 4096
@@ -110,9 +122,12 @@ function sign(secret, payload) {
 }
 
 function makeAccessCookie(secret, secure = false) {
-  const expires = Date.now() + COOKIE_DAYS * 24 * 60 * 60 * 1000
-  const payload = `v1.${expires}`
-  return `${COOKIE_NAME}=${payload}.${sign(secret, payload)}; Path=/; HttpOnly; SameSite=Lax;${secure ? ' Secure;' : ''} Max-Age=${COOKIE_DAYS * 24 * 60 * 60}`
+  const issuedAt = Date.now()
+  const expires = issuedAt + COOKIE_MAX_AGE_MS
+  const payload = `v2.${issuedAt}.${expires}`
+  const attributes = `${COOKIE_NAME}=${payload}.${sign(secret, payload)}`
+    + `; Path=/; HttpOnly; SameSite=Lax; Max-Age=${COOKIE_MAX_AGE_SECONDS}`
+  return secure ? `${attributes}; Secure` : attributes
 }
 
 function parseCookies(header) {
@@ -128,16 +143,54 @@ function parseCookies(header) {
   return result
 }
 
-function accessCookieValid(secret, header) {
+/**
+ * Verify the gateway cookie and report whether it should be rolled forward.
+ * Version 1 cookies (`v1.<expires>`) are still accepted so phones signed in
+ * before the rolling lifetime keep their access; they are upgraded on sight.
+ * @param secret - gateway cookie signing key.
+ * @param header - raw `Cookie` request header.
+ * @returns the verified cookie state, or undefined when it is absent or invalid.
+ */
+function readAccessCookie(secret, header) {
   const value = parseCookies(header)[COOKIE_NAME]
-  if (typeof value !== 'string') return false
+  if (typeof value !== 'string') return undefined
   const dot = value.lastIndexOf('.')
-  if (dot <= 0) return false
+  if (dot <= 0) return undefined
   const payload = value.slice(0, dot)
-  if (!payload.startsWith('v1.')) return false
-  const expires = Number(payload.slice(3))
-  if (!Number.isFinite(expires) || expires <= Date.now()) return false
-  return safeEqualString(value.slice(dot + 1), sign(secret, payload))
+  if (!safeEqualString(value.slice(dot + 1), sign(secret, payload))) return undefined
+  const now = Date.now()
+  if (payload.startsWith('v2.')) {
+    const parts = payload.slice(3).split('.')
+    if (parts.length !== 2) return undefined
+    const issuedAt = Number(parts[0])
+    const expires = Number(parts[1])
+    if (!Number.isSafeInteger(issuedAt) || !Number.isSafeInteger(expires)) return undefined
+    if (issuedAt > now || expires <= now || expires - issuedAt > COOKIE_MAX_AGE_MS) return undefined
+    return { expires, refresh: now - issuedAt >= COOKIE_REFRESH_MS }
+  }
+  if (payload.startsWith('v1.')) {
+    const expires = Number(payload.slice(3))
+    if (!Number.isFinite(expires) || expires <= now) return undefined
+    return { expires, refresh: true }
+  }
+  return undefined
+}
+
+/** Parse the shortest lifetime among a set of Set-Cookie values. */
+function cookieLifetimeMs(cookies) {
+  let shortest = Infinity
+  for (const cookie of cookies) {
+    const maxAge = /;\s*max-age=(\d+)/i.exec(cookie)
+    const expires = /;\s*expires=([^;]+)/i.exec(cookie)
+    let lifetime
+    if (maxAge !== null) lifetime = Number(maxAge[1]) * 1000
+    else if (expires !== null) {
+      const at = Date.parse(expires[1])
+      lifetime = Number.isFinite(at) ? at - Date.now() : undefined
+    }
+    if (lifetime !== undefined && lifetime > 0) shortest = Math.min(shortest, lifetime)
+  }
+  return Number.isFinite(shortest) ? shortest : UPSTREAM_SESSION_MS
 }
 
 function loginPage(options = {}) {
@@ -323,6 +376,11 @@ export function apply(ctx, config) {
     }
   })()
 
+  /** DSH browser session held by the gateway: { cookies, generation, refreshAt }. */
+  let upstreamSession = null
+  let upstreamMint = null
+  let upstreamGeneration = 0
+
   const limiter = createLimiter()
   const sockets = new Set()
   let httpServer = null
@@ -399,6 +457,54 @@ export function apply(ctx, config) {
     })
   }
 
+  /** Mint one DSH browser session and remember when it should be renewed. */
+  async function mintUpstreamSession() {
+    const cookies = await exchangeDshAuth()
+    const lifetime = Math.max(60_000, cookieLifetimeMs(cookies))
+    upstreamGeneration += 1
+    return { cookies, generation: upstreamGeneration, refreshAt: Date.now() + Math.floor(lifetime / 2) }
+  }
+
+  /** Share one in-flight mint between concurrent requests. */
+  function mintUpstreamSessionOnce() {
+    if (upstreamMint === null) {
+      upstreamMint = mintUpstreamSession()
+        .then((session) => {
+          upstreamSession = session
+          return session
+        })
+        .finally(() => {
+          upstreamMint = null
+        })
+    }
+    return upstreamMint
+  }
+
+  /**
+   * Return the DSH session the gateway injects upstream. It lives on this
+   * server, never in the phone's browser, so the phone keeps its access after
+   * DSH restarts or its own session cookie runs out.
+   * @param afterGeneration - when set, accept the cached session only if it is
+   * newer than this generation (the one an upstream 401 just rejected);
+   * otherwise renew it once the cached session reaches half its lifetime.
+   */
+  async function upstreamCookies(afterGeneration = null) {
+    if (afterGeneration === null) {
+      if (upstreamSession !== null && Date.now() < upstreamSession.refreshAt) return upstreamSession
+    } else if (upstreamSession !== null && upstreamSession.generation > afterGeneration) {
+      return upstreamSession
+    }
+    const stale = upstreamSession
+    try {
+      return await mintUpstreamSessionOnce()
+    } catch (error) {
+      // A DSH hiccup must not log the phone out while the previous cookie is
+      // still the better bet; a second 401 below clears it instead.
+      if (stale !== null) return stale
+      throw error
+    }
+  }
+
   function schemeOf(req) {
     if (req.socket.encrypted === true) return 'https'
     // Tailscale Serve and Cloudflare Tunnel terminate TLS locally and forward
@@ -414,10 +520,15 @@ export function apply(ctx, config) {
     return 'http'
   }
 
-  function forwardedHeaders(req, scheme) {
+  function forwardedHeaders(req, scheme, cookies) {
     const headers = { ...req.headers }
     for (const key of HOP_BY_HOP) delete headers[key]
     headers.host = targetAuthority
+    // The gateway owns the upstream DSH session; whatever session cookies the
+    // phone still carries are ignored rather than relayed.
+    const cookieHeader = cookies.map((cookie) => cookie.split(';', 1)[0]).join('; ')
+    if (cookieHeader === '') delete headers.cookie
+    else headers.cookie = cookieHeader
     if (headers.origin !== undefined) headers.origin = targetOrigin
     if (typeof headers.referer === 'string' && headers.referer.startsWith('http')) {
       try {
@@ -446,48 +557,82 @@ export function apply(ctx, config) {
     return `${COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax${scheme === 'https' ? '; Secure' : ''}`
   }
 
-  function proxy(req, res) {
+  function failProxy(res, error) {
+    console.error('[phone-remote] upstream:', error instanceof Error ? error.message : error)
+    if (res.headersSent) {
+      res.destroy()
+      return
+    }
+    const page = errorPage('无法连接 DSH', '电脑上的 DSH 主程序没有响应。请确认 DSH 仍在运行。', 502)
+    res.writeHead(page.status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(page.body)
+  }
+
+  /**
+   * Relay one request to the loopback DSH server with the gateway's DSH session.
+   * A 401 means the upstream session is gone (DSH restarted, or its own lifetime
+   * ran out): mint a fresh one and retry once, so the phone is never asked for
+   * the access code again while its gateway cookie is valid.
+   * @param refreshCookie - rolled gateway cookie to attach, or null.
+   * @param rejectedGeneration - DSH session generation the upstream just
+   * rejected; null on the first try.
+   */
+  async function proxy(req, res, refreshCookie = null, rejectedGeneration = null) {
     const scheme = schemeOf(req)
     const requestOrigin = `${scheme}://${req.headers.host ?? `127.0.0.1:${actualPort}`}`
+    let session
+    try {
+      session = await upstreamCookies(rejectedGeneration)
+    } catch (error) {
+      failProxy(res, error)
+      return
+    }
     const upstream = http.request({
       host: targetHost,
       port: targetPort,
       method: req.method,
       path: req.url,
-      headers: forwardedHeaders(req, scheme),
+      headers: forwardedHeaders(req, scheme, session.cookies),
     }, (response) => {
-      if (response.statusCode === 401
-        && (req.method === 'GET' || req.method === 'HEAD')
-        && String(req.headers.accept ?? '').includes('text/html')) {
+      if (response.statusCode === 401 && (req.method === 'GET' || req.method === 'HEAD')) {
         response.resume()
-        res.writeHead(303, {
-          location: '/',
-          'cache-control': 'no-store',
-          'set-cookie': clearCookie(scheme),
-        })
-        res.end()
-        return
+        if (rejectedGeneration === null) {
+          // Any GET/HEAD can be replayed safely once a fresh DSH session exists.
+          proxy(req, res, refreshCookie, session.generation).catch((error) => failProxy(res, error))
+          return
+        }
+        if (String(req.headers.accept ?? '').includes('text/html')) {
+          // Even a fresh DSH session was refused: the gateway itself has to
+          // re-authenticate, so drop the cookie and show the access-code page.
+          res.writeHead(303, {
+            location: '/',
+            'cache-control': 'no-store',
+            'set-cookie': clearCookie(scheme),
+          })
+          res.end()
+          return
+        }
       }
       const headers = { ...response.headers }
       for (const key of HOP_BY_HOP) delete headers[key]
       if (headers.location !== undefined) headers.location = rewriteLocation(headers.location, requestOrigin)
-      if (headers['set-cookie'] !== undefined) headers['set-cookie'] = headers['set-cookie'].map((cookie) => cookie
-        .replace(/;\s*secure\b/gi, '')
-        .replace(/;\s*domain=[^;]*/gi, ''))
+      if (headers['set-cookie'] !== undefined) {
+        const relayed = headers['set-cookie']
+          .filter((cookie) => !cookie.startsWith(UPSTREAM_COOKIE_PREFIX))
+          .map((cookie) => cookie
+            .replace(/;\s*secure\b/gi, '')
+            .replace(/;\s*domain=[^;]*/gi, ''))
+        if (relayed.length === 0) delete headers['set-cookie']
+        else headers['set-cookie'] = relayed
+      }
+      if (refreshCookie !== null) headers['set-cookie'] = [...(headers['set-cookie'] ?? []), refreshCookie]
       res.writeHead(response.statusCode ?? 502, headers)
       response.pipe(res)
     })
-    upstream.on('error', (error) => {
-      console.error('[phone-remote] upstream:', error.message)
-      if (!res.headersSent) {
-        const page = errorPage('无法连接 DSH', '电脑上的 DSH 主程序没有响应。请确认 DSH 仍在运行。', 502)
-        res.writeHead(page.status, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
-        res.end(page.body)
-      } else {
-        res.destroy()
-      }
-    })
-    req.pipe(upstream)
+    upstream.on('error', (error) => failProxy(res, error))
+    // GET and HEAD carry no body, and a retried request stream is already spent.
+    if (req.method === 'GET' || req.method === 'HEAD') upstream.end()
+    else req.pipe(upstream)
   }
 
   function serveInline(res, status, type, body, extra = {}) {
@@ -566,27 +711,29 @@ export function apply(ctx, config) {
         res.end(loginPage({ error: '访问码不正确，请再试一次。', pin: submitted }))
         return
       }
-      let upstreamCookies
       try {
-        upstreamCookies = await exchangeDshAuth()
+        await mintUpstreamSessionOnce()
       } catch (error) {
         console.error('[phone-remote] auth exchange:', error)
         res.writeHead(502, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
-        res.end(loginPage({ error: '无法为这台手机建立 DSH 会话。请确认电脑上的 DSH 开着，然后重试。' }))
+        res.end(loginPage({ error: '无法建立 DSH 会话。请确认电脑上的 DSH 开着，然后重试。' }))
         return
       }
       limiter.reset(ip)
       res.writeHead(303, {
         location: '/',
         'cache-control': 'no-store',
-        'set-cookie': [makeAccessCookie(state.secret, scheme === 'https'), ...upstreamCookies],
+        'set-cookie': makeAccessCookie(state.secret, scheme === 'https'),
       })
       res.end()
       return
     }
 
-    if (accessCookieValid(state.secret, req.headers.cookie)) {
-      proxy(req, res)
+    const access = readAccessCookie(state.secret, req.headers.cookie)
+    if (access !== undefined) {
+      // Roll the gateway cookie forward so a phone that keeps visiting never
+      // reaches the browser's 400-day clamp; nothing else about the session changes.
+      proxy(req, res, access.refresh ? makeAccessCookie(state.secret, scheme === 'https') : null)
       return
     }
 
@@ -601,39 +748,77 @@ export function apply(ctx, config) {
     res.end('DSH phone remote: authentication required')
   }
 
-  function upgrade(req, socket, head) {
-    if (!accessCookieValid(state?.secret ?? '', req.headers.cookie)) {
+  /**
+   * Tunnel one WebSocket upgrade to the loopback DSH server with the gateway's
+   * DSH session. Like `proxy`, a 401 re-mints the session and retries once.
+   * @param rejectedGeneration - DSH session generation the upstream just
+   * rejected; null on the first try.
+   */
+  async function upgrade(req, socket, head, rejectedGeneration = null) {
+    await statePromise
+    if (readAccessCookie(state?.secret ?? '', req.headers.cookie) === undefined) {
       socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')
       return
     }
-    const upstream = net.connect(targetPort, targetHost, () => {
-      const lines = [`GET ${req.url ?? '/'} HTTP/1.1`]
-      const raw = req.rawHeaders
-      for (let index = 0; index + 1 < raw.length; index += 2) {
-        const key = raw[index]
-        let value = raw[index + 1]
-        const lower = key.toLowerCase()
-        if (lower === 'host') value = targetAuthority
-        else if (lower === 'origin') value = targetOrigin
-        else if (lower === 'referer' && value.startsWith('http')) {
-          try {
-            const referer = new URL(value)
-            if (referer.host !== targetAuthority) value = targetOrigin + referer.pathname + referer.search
-          } catch {
-            value = targetOrigin
-          }
+    let session
+    try {
+      session = await upstreamCookies(rejectedGeneration)
+    } catch (error) {
+      console.error('[phone-remote] session:', error)
+      socket.destroy()
+      return
+    }
+    const cookieHeader = session.cookies.map((cookie) => cookie.split(';', 1)[0]).join('; ')
+    const lines = [`GET ${req.url ?? '/'} HTTP/1.1`]
+    const raw = req.rawHeaders
+    for (let index = 0; index + 1 < raw.length; index += 2) {
+      const key = raw[index]
+      let value = raw[index + 1]
+      const lower = key.toLowerCase()
+      if (lower === 'cookie') continue
+      if (lower === 'host') value = targetAuthority
+      else if (lower === 'origin') value = targetOrigin
+      else if (lower === 'referer' && value.startsWith('http')) {
+        try {
+          const referer = new URL(value)
+          if (referer.host !== targetAuthority) value = targetOrigin + referer.pathname + referer.search
+        } catch {
+          value = targetOrigin
         }
-        lines.push(`${key}: ${value}`)
       }
+      lines.push(`${key}: ${value}`)
+    }
+    lines.push(`Cookie: ${cookieHeader}`)
+
+    const upstream = net.connect(targetPort, targetHost)
+    sockets.add(upstream)
+    upstream.on('close', () => sockets.delete(upstream))
+    upstream.once('error', () => socket.destroy())
+    socket.once('close', () => upstream.destroy())
+    upstream.once('connect', () => {
       upstream.write(lines.join('\r\n') + '\r\n\r\n')
       if (head?.length) upstream.write(head)
+    })
+    // Inspect the upstream status before wiring the tunnel so an expired
+    // session can be renewed instead of reaching the phone as a 401.
+    let received = Buffer.alloc(0)
+    const onData = (chunk) => {
+      received = Buffer.concat([received, chunk])
+      if (!received.includes('\r\n\r\n')) return
+      upstream.off('data', onData)
+      if (rejectedGeneration === null && received.subarray(0, 12).toString('latin1') === 'HTTP/1.1 401') {
+        upstream.destroy()
+        upgrade(req, socket, head, session.generation).catch((error) => {
+          console.error('[phone-remote] upgrade:', error)
+          socket.destroy()
+        })
+        return
+      }
+      socket.write(received)
       socket.pipe(upstream)
       upstream.pipe(socket)
-      sockets.add(upstream)
-      upstream.on('close', () => sockets.delete(upstream))
-    })
-    upstream.on('error', () => socket.destroy())
-    socket.on('error', () => upstream.destroy())
+    }
+    upstream.on('data', onData)
   }
 
   function attach(server, kind) {
@@ -641,7 +826,12 @@ export function apply(ctx, config) {
       sockets.add(socket)
       socket.on('close', () => sockets.delete(socket))
     })
-    server.on('upgrade', upgrade)
+    server.on('upgrade', (req, socket, head) => {
+      upgrade(req, socket, head).catch((error) => {
+        console.error('[phone-remote] upgrade:', error)
+        socket.destroy()
+      })
+    })
     server.on('error', (error) => {
       if (kind === 'https') httpsError = error.message
       else httpError = error.message
